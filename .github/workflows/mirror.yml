@@ -1,0 +1,116 @@
+name: Mirror to GitHub Pages repo
+
+# The enterprise org can only publish private (login-gated) Pages sites, so the
+# public redirect for processtangent.com is served from
+# bigandslow/processtangent-com-redirect. This workflow force-pushes main there.
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger so the mirror can be re-fired without pushing a commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  mirror:
+    if: github.repository == 'process-tangent/processtangent-com-redirect'
+    runs-on: ubuntu-latest
+    # Environment 'mirror' only allows the main branch, so the deploy key
+    # secret can't be read by a workflow pushed to some other branch.
+    environment: mirror
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # SSH deploy key (secret MIRROR_DEPLOY_KEY) that is write-scoped to
+      # bigandslow/processtangent-com-redirect only.
+      - name: Set up mirror deploy key
+        env:
+          MIRROR_DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_DEPLOY_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          # GitHub's published SSH host keys (https://api.github.com/meta).
+          # Pinned rather than ssh-keyscan'd so the push is host-authenticated.
+          cat >> ~/.ssh/known_hosts <<'EOF'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          EOF
+          cat > ~/.ssh/config <<'EOF'
+          Host github-mirror
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/mirror_key
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push to personal repo
+        id: mirror_push
+        run: |
+          git remote add mirror git@github-mirror:bigandslow/processtangent-com-redirect.git
+          git push mirror main --force
+
+      - name: Open or update issue on failure
+        if: failure() && steps.mirror_push.conclusion == 'failure'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const title = 'Mirror to bigandslow/processtangent-com-redirect is failing';
+            const body = [
+              'The mirror workflow that pushes main to `bigandslow/processtangent-com-redirect` failed.',
+              '',
+              `Failing commit: ${context.sha}`,
+              `Failing run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              'The public processtangent.com redirect is served from that repo, so changes merged here will not go live until the mirror succeeds.',
+              '',
+              '**Most likely cause:** the `MIRROR_DEPLOY_KEY` secret or the matching write-enabled deploy key on `bigandslow/processtangent-com-redirect` was removed.',
+              '',
+              '**Fix:** generate a new ed25519 keypair, add the public key as a write-enabled deploy key on the bigandslow repo, store the private key as `MIRROR_DEPLOY_KEY` here, then re-run this workflow.',
+              '',
+              'This issue closes automatically the next time the mirror succeeds.',
+            ].join('\n');
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'mirror-failure', per_page: 5,
+            });
+            if (existing.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['mirror-failure'],
+              });
+            }
+
+      - name: Auto-close mirror-failure issues on success
+        if: success()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'mirror-failure', per_page: 10,
+            });
+            for (const issue of existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Mirror succeeded on commit ${context.sha}; closing.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, state: 'closed',
+              });
+            }
